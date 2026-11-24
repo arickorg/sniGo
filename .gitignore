@@ -1,0 +1,25 @@
+# Compiled binaries and Go build output
+/gop
+/gop.exe
+*.test
+*.out
+/bin/
+/dist/
+
+# Runtime data: config, CA keys/certs, caches, logs
+/config.json
+/ca/
+/cache/
+/logs/
+/state/
+/data/
+/.data/
+*.pem
+*.p12
+*.key
+*.pid
+*.log
+
+# Editor and OS noise
+.DS_Store
+*.swp
