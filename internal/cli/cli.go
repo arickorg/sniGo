@@ -65,6 +65,8 @@ func Main(args []string) int {
 		return 0
 	case "config":
 		return configCommand(rt, rest, opts.json)
+	case "mitm":
+		return mitmCommand(rt, rest, opts.json)
 	case "group":
 		return groupCommand(rt, rest, opts.json)
 	case "ca":
@@ -117,12 +119,14 @@ func usage() {
 	fmt.Print(`gop - Go port of hakimi's local acceleration proxy
 
 Usage:
-  gop serve [--paused] [--no-takeover]   start HTTP + SOCKS5 proxy
+  gop serve [--paused] [--no-takeover] [--mitm auto|on|off]
+                                         start HTTP + SOCKS5 proxy
   gop stop | pause | resume              control a running instance
   gop status [--json]                    runtime status
   gop pac                                print the PAC script
   gop env [--unset] [--json]             shell proxy variables
   gop config show|path|get PATH|set PATH VALUE
+  gop mitm on|off|auto|status [--json]   persist/switch TLS interception
   gop group list|show ID|add ID|rm ID|set ID [--enable|--disable]
   gop ca status|import P12 [PASS]|import-base64 [PASS]|export|regenerate
   gop catalog status|refresh
@@ -136,7 +140,7 @@ Global flags: --data-dir DIR  --json
 func serve(rt *runtime.Runtime, args []string, opts globalOptions) int {
 	paused := false
 	noTakeover := false
-	portChanged := false
+	configChanged := false
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--paused":
@@ -147,19 +151,31 @@ func serve(rt *runtime.Runtime, args []string, opts globalOptions) int {
 			if i+1 < len(args) {
 				i++
 				rt.Config.Proxy.Port, _ = strconv.Atoi(args[i])
-				portChanged = true
+				configChanged = true
 			}
 		case "--socks-port":
 			if i+1 < len(args) {
 				i++
 				rt.Config.Proxy.SocksPort, _ = strconv.Atoi(args[i])
-				portChanged = true
+				configChanged = true
+			}
+		case "--mitm":
+			if i+1 < len(args) {
+				i++
+				mode, err := config.ParseMitmMode(args[i])
+				if err != nil {
+					fmt.Fprintln(os.Stderr, "gop:", err)
+					return 1
+				}
+				rt.Config.Proxy.Mitm = mode
+				configChanged = true
 			}
 		}
 	}
 	_ = noTakeover // the Go port never writes OS proxy settings by default
-	// Persist explicit ports so stop/pause/status can reach this instance.
-	if portChanged {
+	// Persist explicit ports/mitm mode so stop/pause/status and restarts keep
+	// reaching and configuring this instance.
+	if configChanged {
 		_ = config.Save(rt.Paths, rt.Config)
 	}
 	if paused {
@@ -198,6 +214,11 @@ func printStatusFrom(status map[string]any) {
 	fmt.Printf("proxy:        %v\n", proxyInfo["listen"])
 	fmt.Printf("socks:        %v\n", proxyInfo["socks"])
 	fmt.Printf("pac:          %v\n", proxyInfo["pacUrl"])
+	if m, ok := status["mitm"].(map[string]any); ok {
+		fmt.Printf("mitm:         %v (mode=%v, source=%v)\n", m["enabled"], m["mode"], m["source"])
+	} else if v, ok := proxyInfo["mitm"]; ok {
+		fmt.Printf("mitm:         %v\n", v)
+	}
 }
 
 func printStatus(rt *runtime.Runtime) {
@@ -205,6 +226,8 @@ func printStatus(rt *runtime.Runtime) {
 	fmt.Printf("proxy:        %s\n", rt.ProxyURL())
 	fmt.Printf("socks:        %s\n", rt.SOCKSURL())
 	fmt.Printf("pac:          %s\n", rt.PACURL())
+	mode, mitmEnabled, _ := rt.MITMState()
+	fmt.Printf("mitm:         %v (mode=%s)\n", mitmEnabled, mode)
 	fmt.Printf("relay worker: %s\n", rt.WorkerDescription())
 	if !rt.IsRunning() {
 		fmt.Println("start one with `gop serve`")
@@ -249,6 +272,72 @@ func dialHost(bind string) string {
 	default:
 		return bind
 	}
+}
+
+// mitmCommand reads or changes the persisted proxy.mitm setting. When an
+// instance is running it applies the change through the control endpoint so
+// no restart is needed; otherwise only the config file is written.
+func mitmCommand(rt *runtime.Runtime, args []string, asJSON bool) int {
+	sub := "status"
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	if sub == "status" || sub == "show" {
+		mode, enabled, trusted := rt.MITMState()
+		info := map[string]any{
+			"mode":      string(mode),
+			"enabled":   enabled,
+			"caTrusted": trusted,
+			"config":    rt.Paths.ConfigFile(),
+		}
+		if live, err := rt.FetchStatus(); err == nil {
+			if m, ok := live["mitm"].(map[string]any); ok {
+				info["runtime"] = m
+			} else {
+				info["runtimeReachable"] = true
+			}
+		}
+		if asJSON {
+			_ = runtime.PrintJSON(info)
+			return 0
+		}
+		fmt.Printf("mode:       %v\nenabled:    %v\nca trusted: %v\nconfig:     %v\n",
+			info["mode"], info["enabled"], info["caTrusted"], info["config"])
+		if r, ok := info["runtime"].(map[string]any); ok {
+			fmt.Printf("runtime:    enabled=%v mode=%v source=%v\n", r["enabled"], r["mode"], r["source"])
+		} else if info["runtimeReachable"] == true {
+			fmt.Println("runtime:    reachable but reports no mitm info (restart to pick up this build)")
+		} else {
+			fmt.Println("runtime:    no reachable instance (setting applies on next start)")
+		}
+		return 0
+	}
+	mode, err := config.ParseMitmMode(sub)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "gop:", err)
+		return 1
+	}
+	enabled, err := rt.ControlMITM(string(mode))
+	applied := "running instance (immediate)"
+	if err != nil {
+		enabled, err = rt.ApplyMITM(string(mode))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "gop:", err)
+			return 1
+		}
+		applied = "config only (control endpoint unavailable; takes effect on restart)"
+	}
+	if asJSON {
+		_ = runtime.PrintJSON(map[string]any{
+			"mode": string(mode), "enabled": enabled,
+			"applied": applied, "config": rt.Paths.ConfigFile(),
+		})
+		return 0
+	}
+	fmt.Printf("proxy.mitm = %s (enabled: %v)\n", mode, enabled)
+	fmt.Printf("applied:    %s\n", applied)
+	fmt.Printf("config:     %s\n", rt.Paths.ConfigFile())
+	return 0
 }
 
 func configCommand(rt *runtime.Runtime, args []string, asJSON bool) int {
@@ -298,6 +387,14 @@ func configCommand(rt *runtime.Runtime, args []string, asJSON bool) int {
 		if err := config.Save(rt.Paths, rt.Config); err != nil {
 			fmt.Fprintln(os.Stderr, "gop:", err)
 			return 1
+		}
+		// Keep a running instance in sync with proxy.mitm instead of waiting
+		// for a restart. The instance rewrites the same value, so there is no
+		// conflict. Older instances simply lack the endpoint; ignore that.
+		if args[1] == "proxy.mitm" {
+			if _, err := rt.ControlMITM(string(rt.Config.Proxy.Mitm)); err == nil {
+				fmt.Println("applied to running instance")
+			}
 		}
 		fmt.Printf("%s = %v\n", args[1], value)
 	default:

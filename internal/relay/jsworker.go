@@ -369,6 +369,12 @@ func cloneHeaders(src http.Header) http.Header {
 
 // ServeHTTP exposes the worker as an HTTP handler, so a relay base URL can
 // point at this process instead of a public Cloudflare Worker.
+// workerFetchTimeout bounds a single relay request. /pximg is served from a
+// raw connection whose request context carries no deadline, so an unreachable
+// upstream (e.g. i.pximg.net being blocked) would otherwise hold that
+// connection open indefinitely instead of returning a 502.
+var workerFetchTimeout = 15 * time.Second
+
 func (w *JSWorker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	target := req.URL.String()
 	if !strings.Contains(target, "://") {
@@ -385,7 +391,9 @@ func (w *JSWorker) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 		target = scheme + "://" + host + target
 	}
-	out, err := w.Fetch(req.Context(), req.Method, target, req.Header)
+	ctx, cancel := context.WithTimeout(req.Context(), workerFetchTimeout)
+	defer cancel()
+	out, err := w.Fetch(ctx, req.Method, target, req.Header)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadGateway)
 		return

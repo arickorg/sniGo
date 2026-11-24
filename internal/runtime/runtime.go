@@ -8,8 +8,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -43,6 +45,7 @@ type Runtime struct {
 	socksAddr net.Addr
 	stopOnce  chan struct{}
 	client    *http.Client
+	mitmMu    sync.RWMutex
 }
 
 func New(root string) (*Runtime, error) {
@@ -77,12 +80,46 @@ func New(root string) (*Runtime, error) {
 	return r, nil
 }
 
+// MITMState resolves the persisted proxy.mitm setting. In auto mode the OS
+// trust probe (or HAKIMI_GOP_ASSUME_CA=1) decides; on/off override it.
+func (r *Runtime) MITMState() (mode config.MitmMode, enabled, caTrusted bool) {
+	r.mitmMu.RLock()
+	mode = r.Config.Proxy.Mitm.Normalize()
+	r.mitmMu.RUnlock()
+	caTrusted = r.CA.Trusted()
+	present, _ := r.CA.Status()["present"].(bool)
+	return mode, mode.Enabled(caTrusted) && present, caTrusted
+}
+
+// ApplyMITM persists a mode and pushes it into a running proxy so switching
+// takes effect immediately, without a restart.
+func (r *Runtime) ApplyMITM(raw string) (bool, error) {
+	mode, err := config.ParseMitmMode(raw)
+	if err != nil {
+		return false, err
+	}
+	r.mitmMu.Lock()
+	r.Config.Proxy.Mitm = mode
+	err = config.Save(r.Paths, r.Config)
+	r.mitmMu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	_, enabled, _ := r.MITMState()
+	if r.HTTP != nil {
+		r.HTTP.SetMITM(enabled)
+	}
+	return enabled, nil
+}
+
 func (r *Runtime) Start() error {
 	proxyAddr := net.JoinHostPort(r.Config.Proxy.Bind, fmt.Sprint(r.Config.Proxy.Port))
 	script := pac.Generate(r.Config, proxyAddr, r.paused.Load())
+	_, mitmEnabled, _ := r.MITMState()
 	p := proxy.New(proxy.Options{
 		Config: r.Config, Dialer: r.Dialer, Authority: r.CA, Worker: r.Worker,
-		Paused: &r.paused, OnStop: func() { _ = r.Stop() },
+		Paused: &r.paused, MITMEnabled: mitmEnabled,
+		OnStop: func() { _ = r.Stop() }, OnMITM: r.ApplyMITM,
 		OnStatus: func() []byte {
 			raw, _ := json.Marshal(r.StatusJSON())
 			return raw
@@ -212,6 +249,7 @@ func (r *Runtime) StatusJSON() map[string]any {
 			status = "paused"
 		}
 	}
+	mode, mitmEnabled, caTrusted := r.MITMState()
 	return map[string]any{
 		"app":       "hakimi-gop",
 		"version":   "1.0.0",
@@ -223,13 +261,36 @@ func (r *Runtime) StatusJSON() map[string]any {
 			"listen":  r.ProxyURL(),
 			"socks":   r.SOCKSURL(),
 			"mode":    r.Config.Proxy.Mode,
+			"mitm":    mitmEnabled,
 			"pacUrl":  r.PACURL(),
+		},
+		"mitm": map[string]any{
+			"mode":      string(mode),
+			"enabled":   mitmEnabled,
+			"caTrusted": caTrusted,
+			"source":    mitmSource(mode, mitmEnabled),
 		},
 		"ca":      r.CA.Status(),
 		"groups":  len(r.Config.Groups),
 		"relayJs": r.workerPath(),
 		"catalog": map[string]any{"loadedAt": r.Catalog.LoadedAt(), "version": r.Catalog.Version()},
 	}
+}
+
+func mitmSource(mode config.MitmMode, enabled bool) string {
+	switch mode {
+	case config.MitmOn:
+		return "proxy.mitm=on"
+	case config.MitmOff:
+		return "proxy.mitm=off"
+	}
+	if enabled {
+		if os.Getenv("HAKIMI_GOP_ASSUME_CA") == "1" {
+			return "HAKIMI_GOP_ASSUME_CA=1 (auto)"
+		}
+		return "system CA trust (auto)"
+	}
+	return "CA not trusted/available (auto)"
 }
 
 func (r *Runtime) workerPath() string {
@@ -264,6 +325,33 @@ func (r *Runtime) Control(action string) error {
 		return fmt.Errorf("%s returned %s", action, resp.Status)
 	}
 	return nil
+}
+
+// ControlMITM asks a running instance to persist and apply a new mode. The
+// instance writes the config itself so two processes never race on the file.
+func (r *Runtime) ControlMITM(mode string) (bool, error) {
+	addr := net.JoinHostPort(dialHost(r.Config.Proxy.Bind), fmt.Sprint(r.Config.Proxy.Port))
+	endpoint := fmt.Sprintf("http://%s/hakimi/mitm?mode=%s", addr, url.QueryEscape(mode))
+	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("x-hakimi-control", "1")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("mitm returned %s", resp.Status)
+	}
+	var out struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false, err
+	}
+	return out.Enabled, nil
 }
 
 // FetchStatus pulls status from a running instance, like Rust's status command.

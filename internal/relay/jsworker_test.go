@@ -4,11 +4,13 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // workerJSFromRepo locates the SAME checked-in JS file used by the Rust repo.
@@ -110,6 +112,34 @@ func TestJSWorkerRejectsWrongPathAndMethod(t *testing.T) {
 	}
 	if resp.Status != 405 {
 		t.Fatalf("expected 405, got %d", resp.Status)
+	}
+}
+
+// TestServeHTTPBoundsSlowUpstream guards against /pximg hanging forever when
+// the upstream image host is unreachable: the raw CONNECT-side request has no
+// deadline of its own, so JSWorker.ServeHTTP must supply one.
+func TestServeHTTPBoundsSlowUpstream(t *testing.T) {
+	w, err := NewJSWorker(workerJSFromRepo(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := workerFetchTimeout
+	workerFetchTimeout = 120 * time.Millisecond
+	defer func() { workerFetchTimeout = original }()
+
+	w.SetFetchHook(func(req *http.Request) (*http.Response, error) {
+		<-req.Context().Done()
+		return nil, req.Context().Err()
+	})
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8443/pximg/img-master/a.jpg", nil)
+	rw := httptest.NewRecorder()
+	start := time.Now()
+	w.ServeHTTP(rw, req)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("relay request took %s, expected the fetch timeout to bound it", elapsed)
+	}
+	if rw.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502 on a timed-out upstream", rw.Code)
 	}
 }
 

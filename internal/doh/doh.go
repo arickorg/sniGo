@@ -5,7 +5,6 @@ package doh
 import (
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +17,14 @@ import (
 	"sync"
 	"time"
 )
+
+// SharedECHDomain publishes Cloudflare's shared ECHConfigList. CF-fronted
+// domains that do not publish their own ECHConfig (www.pixiv.net is the
+// canonical example) can still be reached with ECH using this config. This
+// mirrors the Rust core's "shared ECH" fallback used by the Pixiv group.
+const SharedECHDomain = "cloudflare-ech.com"
+
+const sharedECHTTL = 30 * time.Minute
 
 type Answer struct {
 	Addresses []net.IP
@@ -60,6 +67,114 @@ func New(primary, fallback string, custom []string) *Resolver {
 }
 
 func (r *Resolver) Endpoints() []string { return append([]string(nil), r.endpoint...) }
+
+// SharedECH returns Cloudflare's shared ECHConfigList, cached for 30 minutes.
+// An expired entry is still served when the live lookup fails, matching the
+// Rust core's stale-while-revalidate behaviour for ECH configs.
+func (r *Resolver) SharedECH(ctx context.Context) ([]byte, error) {
+	return r.echConfig(ctx, SharedECHDomain)
+}
+
+// echConfig returns the ECHConfigList published in host's HTTPS RR.
+func (r *Resolver) echConfig(ctx context.Context, host string) ([]byte, error) {
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	key := "ECH:" + host
+
+	r.mu.Lock()
+	if cached, ok := r.cache[key]; ok && len(cached.answer.ECH) > 0 {
+		age := time.Since(cached.at)
+		fresh := age < sharedECHTTL
+		ech := append([]byte(nil), cached.answer.ECH...)
+		r.mu.Unlock()
+		if fresh {
+			return ech, nil
+		}
+		// Refresh off the critical path; keep serving the stale config.
+		go func() {
+			fresh, err := r.queryECH(context.Background(), host, r.echEndpoints())
+			if err != nil || len(fresh) == 0 {
+				return
+			}
+			r.mu.Lock()
+			r.cache[key] = cacheEntry{
+				answer: Answer{ECH: fresh, Source: "doh", TTL: sharedECHTTL},
+				at:     time.Now(),
+			}
+			r.mu.Unlock()
+		}()
+		return ech, nil
+	}
+	r.mu.Unlock()
+
+	ech, err := r.queryECH(ctx, host, r.echEndpoints())
+	if err == nil && len(ech) > 0 {
+		r.mu.Lock()
+		r.cache[key] = cacheEntry{
+			answer: Answer{ECH: ech, Source: "doh", TTL: sharedECHTTL},
+			at:     time.Now(),
+		}
+		r.mu.Unlock()
+		return ech, nil
+	}
+	if err == nil {
+		err = fmt.Errorf("no ECHConfig in HTTPS RR for %s", host)
+	}
+	return nil, err
+}
+
+// echEndpoints is the DoH pool used for HTTPS RR lookups. AliDNS is appended
+// as an extra fallback because it reliably serves cloudflare-ech.com even
+// when the primary pool does not (the same fallback the Rust core uses).
+func (r *Resolver) echEndpoints() []string {
+	candidates := append(r.orderedEndpoints(), "https://dns.alidns.com/dns-query")
+	seen := make(map[string]bool, len(candidates))
+	out := make([]string, 0, len(candidates))
+	for _, ep := range candidates {
+		if ep != "" && !seen[ep] {
+			seen[ep] = true
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
+// queryECH races the HTTPS RR query across all endpoints and returns the
+// first usable ECHConfigList. query() already falls back from the JSON API to
+// RFC 8484 wire format, which is essential here: doh.pub and AliDNS both
+// reject type=HTTPS over JSON but answer it correctly in wire format.
+func (r *Resolver) queryECH(ctx context.Context, host string, endpoints []string) ([]byte, error) {
+	if len(endpoints) == 0 {
+		return nil, errors.New("no DoH endpoints configured")
+	}
+	type result struct {
+		ech []byte
+		err error
+	}
+	ch := make(chan result, len(endpoints))
+	for _, ep := range endpoints {
+		go func(ep string) {
+			ans, err := r.query(ctx, ep, host, "HTTPS")
+			if err == nil && len(ans.ECH) > 0 {
+				ans.ECH = normalizeECHConfigList(ans.ECH)
+			}
+			ch <- result{ech: ans.ECH, err: err}
+		}(ep)
+	}
+	var firstErr error
+	for range endpoints {
+		res := <-ch
+		if res.err == nil && len(res.ech) > 0 {
+			return res.ech, nil
+		}
+		if firstErr == nil && res.err != nil {
+			firstErr = res.err
+		}
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return nil, fmt.Errorf("no ECHConfig in HTTPS RR for %s", host)
+}
 
 type dohJSON struct {
 	Answer []struct {
@@ -121,7 +236,8 @@ func (r *Resolver) refresh(ctx context.Context, host string) (Answer, error) {
 		ans Answer
 		err error
 	}
-	ch := make(chan result, len(endpoints)*2)
+	total := len(endpoints) * 3
+	ch := make(chan result, total)
 	launch := func(ep, qtype string) {
 		go func() {
 			ans, err := r.query(ctx, ep, host, qtype)
@@ -131,13 +247,14 @@ func (r *Resolver) refresh(ctx context.Context, host string) (Answer, error) {
 	for _, ep := range endpoints {
 		launch(ep, "A")
 		launch(ep, "AAAA")
+		launch(ep, "HTTPS") // RFC 9460 HTTPS RR carries the ECHConfigList
 	}
 
 	merged := Answer{Source: "doh"}
 	var firstErr error
 	seen := map[string]bool{}
 	deadline := time.After(5 * time.Second)
-	for range endpoints {
+	for range total {
 		if len(merged.Addresses) > 0 && merged.ECH != nil {
 			break
 		}
@@ -195,7 +312,83 @@ func (r *Resolver) orderedEndpoints() []string {
 	return out
 }
 
+// query tries the JSON API first, then falls back to RFC 8484 wire format.
+// Many resolvers (e.g. cloudflare-dns.com) only accept application/dns-message,
+// and some JSON APIs reject type=HTTPS while answering the same query in wire
+// format. ECHConfig lives in the HTTPS RR, so the fallback is essential.
 func (r *Resolver) query(ctx context.Context, endpoint, host, qtype string) (Answer, error) {
+	jsonAns, jsonErr := r.queryJSON(ctx, endpoint, host, qtype)
+	needWire := jsonErr != nil || (qtype == "HTTPS" && jsonAns.ECH == nil)
+	if !needWire {
+		return jsonAns, nil
+	}
+	wireAns, wireErr := r.queryWire(ctx, endpoint, host, qtype)
+	if wireErr == nil {
+		merged := jsonAns
+		if len(merged.Addresses) == 0 {
+			merged.Addresses = wireAns.Addresses
+		}
+		if merged.ECH == nil {
+			merged.ECH = wireAns.ECH
+		}
+		if merged.Source == "" {
+			merged.Source = wireAns.Source
+		}
+		if merged.TTL == 0 {
+			merged.TTL = wireAns.TTL
+		}
+		if len(merged.Addresses) > 0 || merged.ECH != nil {
+			r.mark(endpoint, true)
+			return merged, nil
+		}
+	}
+	if jsonErr == nil {
+		return jsonAns, nil
+	}
+	if wireErr != nil {
+		return Answer{}, wireErr
+	}
+	return Answer{}, jsonErr
+}
+
+func (r *Resolver) queryWire(ctx context.Context, endpoint, host, qtype string) (Answer, error) {
+	qt := wireTypeA
+	switch qtype {
+	case "AAAA":
+		qt = wireTypeAAAA
+	case "HTTPS":
+		qt = wireTypeHTTPS
+	}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return Answer{}, err
+	}
+	q := u.Query()
+	q.Set("dns", base64.RawURLEncoding.EncodeToString(buildWireQuery(host, qt)))
+	u.RawQuery = q.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return Answer{}, err
+	}
+	req.Header.Set("Accept", "application/dns-message")
+	resp, err := r.client.Do(req)
+	if err != nil {
+		r.mark(endpoint, false)
+		return Answer{}, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return Answer{}, fmt.Errorf("%s wire returned %d", endpoint, resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return Answer{}, err
+	}
+	ips, ech := parseWireAnswer(body, host)
+	return Answer{Addresses: ips, ECH: ech, Source: sourceOf(endpoint), TTL: 5 * time.Minute}, nil
+}
+
+func (r *Resolver) queryJSON(ctx context.Context, endpoint, host, qtype string) (Answer, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return Answer{}, err
@@ -272,33 +465,34 @@ func sourceOf(endpoint string) string {
 }
 
 // parseECHFromHTTPS decodes an RFC 9460 presentation-form HTTPS record and
-// extracts parameter 5 (ech), whose value is a base64 ECHConfigList.
+// extracts parameter 5 (ech), whose value is a base64 ECHConfigList. The
+// result is always a complete ECHConfigList with the uint16 length prefix
+// that crypto/tls requires.
 func parseECHFromHTTPS(record string) []byte {
 	fields := strings.Fields(record)
 	for i, f := range fields {
-		if strings.EqualFold(f, "ech=") && i+1 < len(fields) {
-			raw := fields[i+1]
-			if decoded, err := base64.StdEncoding.DecodeString(raw); err == nil {
-				return decoded
-			}
+		var raw string
+		switch {
+		case strings.EqualFold(f, "ech=") && i+1 < len(fields):
+			raw = fields[i+1]
+		case strings.HasPrefix(strings.ToLower(f), "ech="):
+			raw = f[4:]
+		default:
+			continue
 		}
-		if strings.HasPrefix(strings.ToLower(f), "ech=") {
-			raw := f[4:]
-			if len(raw) >= 2 && raw[0] == '"' && raw[len(raw)-1] == '"' {
-				raw = raw[1 : len(raw)-1]
-			}
-			if decoded, err := base64.StdEncoding.DecodeString(raw); err == nil && len(decoded) > 3 {
-				// HTTPS RR ech values in DoH JSON are sometimes wrapped with a
-				// two-byte key; ECHConfigList itself starts with 0xfe 0x0d.
-				if binary.BigEndian.Uint16(decoded[:2]) == 0xfe0d {
-					return decoded
-				}
-				for n := 2; n+4 < len(decoded); n++ {
-					if decoded[n] == 0xfe && decoded[n+1] == 0x0d {
-						return decoded[n:]
-					}
-				}
-			}
+		raw = strings.Trim(raw, `"`)
+		if raw == "" {
+			continue
+		}
+		decoded, err := base64.StdEncoding.DecodeString(raw)
+		if err != nil {
+			decoded, err = base64.RawStdEncoding.DecodeString(raw)
+		}
+		if err != nil {
+			continue
+		}
+		if cfg := normalizeECHConfigList(decoded); cfg != nil {
+			return cfg
 		}
 	}
 	return nil

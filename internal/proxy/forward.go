@@ -85,33 +85,11 @@ func (s *Server) localRelayHost() string {
 	return domain.HostOf(s.Addr().String())
 }
 
+// sendDirect forwards a request upstream. A TLS handshake can succeed and the
+// upstream can still reset the connection while the HTTP response is being
+// read (typical of SNI-filtered hosts). Those failures are retried on the next
+// candidate IP; non-idempotent methods are never replayed.
 func (s *Server) sendDirect(ctx context.Context, req *http.Request, host, port, mitmHost string) (*http.Response, error) {
-	transport := &http.Transport{
-		Proxy: nil,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			h, p, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			return s.dialer.DialTCP(ctx, h, p)
-		},
-		DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			h, p, err := net.SplitHostPort(addr)
-			if err != nil {
-				return nil, err
-			}
-			attempts := s.dialerMode(h)
-			conn, _, _, err := s.dialer.DialTLS(ctx, h, p, attempts)
-			return conn, err
-		},
-		TLSHandshakeTimeout:   12 * time.Second,
-		ResponseHeaderTimeout: 30 * time.Second,
-		DisableCompression:    true,
-		MaxIdleConns:          64,
-		IdleConnTimeout:       90 * time.Second,
-		ForceAttemptHTTP2:     true,
-	}
-
 	targetURL := *req.URL
 	targetURL.Scheme = req.URL.Scheme
 	if targetURL.Scheme == "" {
@@ -120,21 +98,65 @@ func (s *Server) sendDirect(ctx context.Context, req *http.Request, host, port, 
 	if targetURL.Host == "" {
 		targetURL.Host = net.JoinHostPort(host, port)
 	}
-	outReq := req.Clone(ctx)
-	outReq.URL = &targetURL
-	outReq.RequestURI = ""
-	outReq.Host = host
-	stripHopHeaders(outReq.Header)
-	outReq.Header.Set("Host", net.JoinHostPort(host, port))
 
-	client := &http.Client{Transport: transport, Timeout: 0, CheckRedirect: func(*http.Request, []*http.Request) error {
-		return http.ErrUseLastResponse
-	}}
-	resp, err := client.Do(outReq)
-	if err != nil {
-		return nil, err
+	maxAttempts := 3
+	if req.Method != http.MethodGet && req.Method != http.MethodHead {
+		maxAttempts = 1 // never replay a request that may have side effects
 	}
-	return resp, nil
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var usedIP net.IP
+		transport := &http.Transport{
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				h, p, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				return s.dialer.DialTCP(ctx, h, p)
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				h, p, err := net.SplitHostPort(addr)
+				if err != nil {
+					return nil, err
+				}
+				conn, ip, _, err := s.dialer.DialTLS(ctx, h, p, s.dialerMode(h))
+				if err == nil {
+					usedIP = ip
+				}
+				return conn, err
+			},
+			TLSHandshakeTimeout:   12 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
+			DisableCompression:    true,
+			MaxIdleConns:          64,
+			IdleConnTimeout:       90 * time.Second,
+			ForceAttemptHTTP2:     true,
+		}
+
+		urlCopy := targetURL
+		outReq := req.Clone(ctx)
+		outReq.URL = &urlCopy
+		outReq.RequestURI = ""
+		outReq.Host = host
+		stripHopHeaders(outReq.Header)
+		outReq.Header.Set("Host", net.JoinHostPort(host, port))
+
+		client := &http.Client{Transport: transport, Timeout: 0, CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}}
+		resp, err := client.Do(outReq)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		transport.CloseIdleConnections()
+		if usedIP == nil {
+			break // failed before any upstream connection was established
+		}
+		s.dialer.MarkFailed(host, usedIP)
+	}
+	return nil, lastErr
 }
 
 func (s *Server) dialerMode(host string) []config.RouteAttempt {

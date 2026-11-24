@@ -44,6 +44,9 @@ type ProxyConfig struct {
 	Port     int    `json:"port"`
 	Bind     string `json:"bind"`
 	Takeover bool   `json:"takeover"`
+	// Mitm persists the TLS interception switch across restarts:
+	// auto (CA trust), on (always), off (never).
+	Mitm MitmMode `json:"mitm"`
 	// SocksPort enables the SOCKS5 listener. 0 disables it. Rust has no
 	// SOCKS5; this is the Go port's addition requested by the user.
 	SocksPort int `json:"socksPort"`
@@ -168,7 +171,7 @@ func Default() AppConfig {
 			DohMirrors:  []string{},
 			TimeoutSecs: 5,
 		},
-		Proxy:  ProxyConfig{Mode: "pac", Port: 8443, Bind: "127.0.0.1", Takeover: true, SocksPort: 1080},
+		Proxy:  ProxyConfig{Mode: "pac", Port: 8443, Bind: "127.0.0.1", Takeover: true, Mitm: MitmAuto, SocksPort: 1080},
 		Groups: defaultGroups(),
 		Advanced: AdvancedConfig{
 			FakeSNICandidates:      []string{"www.bing.com"},
@@ -227,6 +230,11 @@ func defaultGroups() []GroupConfig {
 			Domains: []DomainRule{rule("www.google.com", SNIRoute("www.google.com.")), rule("www.google.com.hk", SNIRoute("www.google.com.hk."))}},
 	}
 	return groups
+}
+
+// MITMEnabled resolves the persisted proxy.mitm setting against CA trust.
+func (c *AppConfig) MITMEnabled(trusted bool) bool {
+	return c.Proxy.Mitm.Enabled(trusted)
 }
 
 func (c *AppConfig) EnabledGroups() []GroupConfig {

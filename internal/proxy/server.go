@@ -5,6 +5,7 @@ package proxy
 import (
 	"bufio"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -22,14 +23,16 @@ import (
 )
 
 type Server struct {
-	cfg       *config.AppConfig
-	dialer    *Dialer
-	authority *ca.Authority
-	health    *relay.Health
-	worker    *relay.JSWorker
-	paused    *atomic.Bool
-	onStop    func()
-	onStatus  func() []byte
+	cfg         *config.AppConfig
+	dialer      *Dialer
+	authority   *ca.Authority
+	health      *relay.Health
+	worker      *relay.JSWorker
+	paused      *atomic.Bool
+	mitmEnabled atomic.Bool
+	onStop      func()
+	onStatus    func() []byte
+	onMITM      func(string) (bool, error)
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -38,22 +41,35 @@ type Server struct {
 }
 
 type Options struct {
-	Config    *config.AppConfig
-	Dialer    *Dialer
-	Authority *ca.Authority
-	Worker    *relay.JSWorker
-	Paused    *atomic.Bool
-	OnStop    func()
-	OnStatus  func() []byte
+	Config      *config.AppConfig
+	Dialer      *Dialer
+	Authority   *ca.Authority
+	Worker      *relay.JSWorker
+	Paused      *atomic.Bool
+	MITMEnabled bool
+	OnStop      func()
+	OnStatus    func() []byte
+	// OnMITM applies and persists a new proxy.mitm mode at runtime, returning
+	// whether interception should be enabled afterwards.
+	OnMITM func(string) (bool, error)
 }
 
 func New(opts Options) *Server {
-	return &Server{
+	s := &Server{
 		cfg: opts.Config, dialer: opts.Dialer, authority: opts.Authority,
-		worker: opts.Worker, paused: opts.Paused, onStop: opts.OnStop, onStatus: opts.OnStatus,
+		worker: opts.Worker, paused: opts.Paused, onStop: opts.OnStop,
+		onStatus: opts.OnStatus, onMITM: opts.OnMITM,
 		health: relay.NewHealth(), conns: map[net.Conn]struct{}{},
 	}
+	s.mitmEnabled.Store(opts.MITMEnabled)
+	return s
 }
+
+// SetMITM switches interception on an already running instance. Only the
+// control endpoint and the runtime should call this.
+func (s *Server) SetMITM(enabled bool) { s.mitmEnabled.Store(enabled) }
+
+func (s *Server) MITMEnabled() bool { return s.mitmEnabled.Load() }
 
 func (s *Server) SetPAC(script string) {
 	s.mu.Lock()
@@ -187,6 +203,27 @@ func (s *Server) localResponse(bw *bufio.Writer, req *http.Request) {
 			s.paused.Store(false)
 		}
 		write(200, "text/plain", []byte("resumed"))
+	case "/hakimi/mitm":
+		if req.Method != http.MethodPost || req.Header.Get("x-hakimi-control") != "1" {
+			write(405, "text/plain", []byte("method not allowed"))
+			break
+		}
+		mode, err := config.ParseMitmMode(req.URL.Query().Get("mode"))
+		if err != nil {
+			write(400, "text/plain", []byte(err.Error()))
+			break
+		}
+		enabled := mode.Enabled(s.authority != nil && s.authority.Trusted())
+		if s.onMITM != nil {
+			enabled, err = s.onMITM(string(mode))
+			if err != nil {
+				write(500, "text/plain", []byte(err.Error()))
+				break
+			}
+		}
+		s.mitmEnabled.Store(enabled)
+		body, _ := json.Marshal(map[string]any{"mode": string(mode), "enabled": enabled})
+		write(200, "application/json", body)
 	case "/hakimi/stop":
 		if req.Method == http.MethodPost && req.Header.Get("x-hakimi-control") == "1" {
 			write(200, "application/json", []byte(`{"stopping":true}`))
@@ -274,7 +311,9 @@ func (s *Server) handleConnect(conn net.Conn, bw *bufio.Writer, req *http.Reques
 }
 
 func (s *Server) decideMITM(host string) (string, string, bool) {
-	if domain.IsIPLiteral(host) || s.paused.Load() || s.authority == nil || !s.authority.Trusted() {
+	// The switch comes from the persisted proxy.mitm setting (resolved against
+	// CA trust at startup) instead of probing the OS trust store per request.
+	if domain.IsIPLiteral(host) || s.paused.Load() || s.authority == nil || !s.mitmEnabled.Load() {
 		return "", "", false
 	}
 	g, r, ok := s.cfg.Match(host)

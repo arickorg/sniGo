@@ -26,7 +26,9 @@ type dialResult struct {
 type candidateResult struct {
 	ip      net.IP
 	latency time.Duration
-	err     error
+	tlsOK   bool
+	err     error // TCP dial error
+	tlsErr  error // TLS handshake error (only when TLS probing is enabled)
 }
 
 type plan struct {
@@ -43,8 +45,16 @@ type Dialer struct {
 	catalog  *catalog.Store
 	lastGood map[string]lastGoodEntry
 	plans    map[string]planCacheEntry
-	mu       sync.Mutex
+	// IPs that completed TCP+TLS but failed during the HTTP exchange. They
+	// still pass the reachability probes, so without this feedback every retry
+	// would pick the same IP again.
+	failed map[string]map[string]time.Time
+	mu     sync.Mutex
 }
+
+// failedIPCooldown mirrors the Rust core's short cooldown for routes that
+// fail after a handshake.
+const failedIPCooldown = 60 * time.Second
 
 type lastGoodEntry struct {
 	ip net.IP
@@ -62,7 +72,62 @@ func NewDialer(cfg *config.AppConfig, resolver *doh.Resolver, store *catalog.Sto
 		cfg: cfg, resolver: resolver, catalog: store,
 		lastGood: map[string]lastGoodEntry{},
 		plans:    map[string]planCacheEntry{},
+		failed:   map[string]map[string]time.Time{},
 	}
+}
+
+// MarkFailed records an upstream IP that failed after the TLS handshake
+// succeeded (for example a connection reset while reading the response). It
+// also drops the cached plan/last-good entry for that IP so the next dial does
+// not immediately reuse the same route.
+func (d *Dialer) MarkFailed(host string, ip net.IP) {
+	if ip == nil {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.failed == nil {
+		d.failed = map[string]map[string]time.Time{}
+	}
+	byIP := d.failed[host]
+	if byIP == nil {
+		byIP = map[string]time.Time{}
+		d.failed[host] = byIP
+	}
+	byIP[ip.String()] = time.Now()
+	delete(d.plans, host)
+	if d.lastGood[host].ip.Equal(ip) {
+		delete(d.lastGood, host)
+	}
+}
+
+// deprioritizeFailed moves recently failed IPs behind healthy candidates.
+// They are kept as a last resort: a host with a single reachable IP must still
+// be dialable after that IP had one bad response.
+func (d *Dialer) deprioritizeFailed(host string, ips []net.IP) []net.IP {
+	d.mu.Lock()
+	bad := map[string]bool{}
+	for ip, at := range d.failed[host] {
+		if time.Since(at) < failedIPCooldown {
+			bad[ip] = true
+		} else {
+			delete(d.failed[host], ip)
+		}
+	}
+	d.mu.Unlock()
+	if len(bad) == 0 || len(ips) < 2 {
+		return ips
+	}
+	good := make([]net.IP, 0, len(ips))
+	fallback := make([]net.IP, 0, len(ips))
+	for _, ip := range ips {
+		if bad[ip.String()] {
+			fallback = append(fallback, ip)
+		} else {
+			good = append(good, ip)
+		}
+	}
+	return append(good, fallback...)
 }
 
 func (d *Dialer) modeAttempts(host string) []config.RouteAttempt {
@@ -98,7 +163,10 @@ func (d *Dialer) candidates(ctx context.Context, host string) ([]net.IP, doh.Ans
 	if limit <= 0 {
 		limit = 8
 	}
-	ips := catalog.Candidates(lastGoodIPs, catalogIPs, resolved, limit)
+	// Candidates(catalog, doh, lastGood): pass arguments in the declared
+	// order. Previously they were passed as (lastGood, catalog, doh), which
+	// inverted the intended priority and put DoH results first.
+	ips := catalog.Candidates(catalogIPs, resolved, lastGoodIPs, limit)
 	if len(ips) == 0 {
 		if err != nil {
 			return nil, answer, err
@@ -108,12 +176,25 @@ func (d *Dialer) candidates(ctx context.Context, host string) ([]net.IP, doh.Ans
 	return ips, answer, nil
 }
 
-func (d *Dialer) probe(ctx context.Context, ips []net.IP, port string) []net.IP {
+// probe measures TCP reachability for each candidate, then optionally probes
+// TLS on a bounded subset of the fastest ones. TLS-reachable candidates are
+// ranked first; TCP-only candidates remain as a fallback so the tunnel still
+// works when no IP completes a pre-handshake (e.g. plain HTTP or a network
+// that blocks all TLS). Blasting a ClientHello at every candidate can trip
+// anti-abuse blocking, so the TLS fan-out is deliberately kept small.
+func (d *Dialer) probe(ctx context.Context, ips []net.IP, port, tlsServerName string) []net.IP {
+	_ = ctx // probe uses bounded DialTimeout so it cannot hang on a dead IP
 	timeout := time.Duration(d.cfg.Advanced.IPTimeoutMs) * time.Millisecond
 	if timeout <= 0 {
 		timeout = 2 * time.Second
 	}
-	results := make(chan candidateResult, len(ips))
+	tlsTimeout := timeout * 2
+	if tlsTimeout < 3*time.Second {
+		tlsTimeout = 3 * time.Second
+	}
+
+	// Phase 1: cheap, concurrent TCP reachability for all candidates.
+	tcpCh := make(chan candidateResult, len(ips))
 	for _, ip := range ips {
 		go func(ip net.IP) {
 			start := time.Now()
@@ -122,22 +203,87 @@ func (d *Dialer) probe(ctx context.Context, ips []net.IP, port string) []net.IP 
 			if err == nil {
 				_ = conn.Close()
 			}
-			results <- candidateResult{ip: ip, latency: latency, err: err}
+			tcpCh <- candidateResult{ip: ip, latency: latency, err: err}
 		}(ip)
 	}
-	var good []candidateResult
+	var reachable []candidateResult
 	for range ips {
-		res := <-results
+		res := <-tcpCh
 		if res.err == nil {
-			good = append(good, res)
+			reachable = append(reachable, res)
 		}
 	}
-	sort.Slice(good, func(i, j int) bool { return good[i].latency < good[j].latency })
-	out := make([]net.IP, 0, len(good))
-	for _, g := range good {
-		out = append(out, g.ip)
+	sort.Slice(reachable, func(i, j int) bool { return reachable[i].latency < reachable[j].latency })
+	if tlsServerName == "" || len(reachable) == 0 {
+		out := make([]net.IP, 0, len(reachable))
+		for _, r := range reachable {
+			out = append(out, r.ip)
+		}
+		return out
+	}
+
+	// Phase 2: TLS pre-handshake on at most maxTLSProbe fastest candidates.
+	const maxTLSProbe = 4
+	probeSet := reachable
+	if len(probeSet) > maxTLSProbe {
+		probeSet = probeSet[:maxTLSProbe]
+	}
+	results := make(chan candidateResult, len(probeSet))
+	for _, base := range probeSet {
+		go func(base candidateResult) {
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(base.ip.String(), port), timeout)
+			res := candidateResult{ip: base.ip, latency: base.latency, err: err}
+			if err == nil {
+				// Identity is verified by the actual client later; this probe only
+				// checks whether the IP can complete a TLS handshake at all.
+				tlsConn := tls.Client(conn, &tls.Config{
+					ServerName:         tlsServerName,
+					InsecureSkipVerify: true, // #nosec G402 - reachability probe only
+					MinVersion:         tls.VersionTLS12,
+				})
+				_ = tlsConn.SetDeadline(time.Now().Add(tlsTimeout))
+				if handshakeErr := tlsConn.Handshake(); handshakeErr != nil {
+					res.tlsErr = handshakeErr
+				} else {
+					res.tlsOK = true
+				}
+				_ = conn.Close()
+			}
+			results <- res
+		}(base)
+	}
+	var tlsGood []candidateResult
+	for range probeSet {
+		res := <-results
+		if res.err == nil && res.tlsOK {
+			tlsGood = append(tlsGood, res)
+		}
+	}
+	sort.Slice(tlsGood, func(i, j int) bool { return tlsGood[i].latency < tlsGood[j].latency })
+
+	seen := make(map[string]bool, len(tlsGood))
+	out := make([]net.IP, 0, len(reachable))
+	for _, r := range tlsGood {
+		out = append(out, r.ip)
+		seen[r.ip.String()] = true
+	}
+	for _, r := range reachable {
+		if !seen[r.ip.String()] {
+			out = append(out, r.ip)
+		}
 	}
 	return out
+}
+
+// tlsPort reports whether a raw TCP tunnel to this port is expected to carry
+// TLS. Only those ports get a pre-handshake probe; plain HTTP/SSH traffic must
+// not have a ClientHello injected by the proxy.
+func tlsPort(port string) bool {
+	switch port {
+	case "443", "8443":
+		return true
+	}
+	return false
 }
 
 // DialTCP connects to host:port without TLS (raw CONNECT tunnel / plain proxy).
@@ -149,7 +295,11 @@ func (d *Dialer) DialTCP(ctx context.Context, host, port string) (net.Conn, erro
 	if err != nil {
 		return nil, err
 	}
-	ordered := d.probe(ctx, ips, port)
+	sni := ""
+	if tlsPort(port) {
+		sni = host
+	}
+	ordered := d.deprioritizeFailed(host, d.probe(ctx, ips, port, sni))
 	if len(ordered) == 0 {
 		return nil, fmt.Errorf("all candidate IPs failed for %s", host)
 	}
@@ -163,6 +313,61 @@ func (d *Dialer) DialTCP(ctx context.Context, host, port string) (net.Conn, erro
 		dialErr = err
 	}
 	return nil, dialErr
+}
+
+// echConfigFor selects the ECHConfigList for an ECH attempt. "own" uses only
+// the domain's own HTTPS RR; "shared" (the default, and what the Pixiv group
+// uses) falls back to Cloudflare's shared config when the domain publishes no
+// ECHConfig of its own. CF-fronted sites such as www.pixiv.net are in the
+// latter category, so without the shared fallback every ECH attempt is
+// skipped and the route degrades to a plain direct handshake.
+func echConfigFor(attempt config.RouteAttempt, own []byte, shared func() []byte) []byte {
+	if len(own) > 0 {
+		return own
+	}
+	if attempt.Ech == "own" || shared == nil {
+		return nil
+	}
+	return shared()
+}
+
+// buildTLSConfig builds the upstream TLS config. crypto/tls requires
+// MinVersion >= TLS 1.3 whenever EncryptedClientHelloConfigList is set;
+// leaving it at TLS 1.2 makes every ECH attempt fail before a single byte is
+// sent. The ECHConfigList's public name is used for the outer SNI by the
+// standard library, so normal certificate verification against the real
+// hostname still applies. Fake SNI changes only the outer SNI and therefore
+// needs a manual certificate check against the original hostname.
+func buildTLSConfig(host, serverName string, ech []byte) *tls.Config {
+	minVersion := uint16(tls.VersionTLS12)
+	if len(ech) > 0 {
+		minVersion = tls.VersionTLS13
+	}
+	cfg := &tls.Config{
+		ServerName:                     serverName,
+		MinVersion:                     minVersion,
+		EncryptedClientHelloConfigList: ech,
+		NextProtos:                     []string{"h2", "http/1.1"},
+	}
+	if serverName != host {
+		cfg.InsecureSkipVerify = true
+		cfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+			if len(rawCerts) == 0 {
+				return fmt.Errorf("no certificate from %s", host)
+			}
+			cert, err := x509.ParseCertificate(rawCerts[0])
+			if err != nil {
+				return err
+			}
+			roots, err := x509.SystemCertPool()
+			if err != nil {
+				return err
+			}
+			_, err = cert.Verify(x509.VerifyOptions{Roots: roots, DNSName: host})
+			return err
+		}
+	}
+	return cfg
 }
 
 // DialTLS performs the selected TLS strategy and returns a verified connection.
@@ -184,14 +389,22 @@ func (d *Dialer) DialTLS(ctx context.Context, host, port string, attempts []conf
 	if err != nil {
 		return nil, nil, "", err
 	}
-	ordered := d.probe(ctx, ips, port)
+	ordered := d.probe(ctx, ips, port, "")
 	if len(ordered) == 0 {
 		// Probe measures TCP only; keep candidates when the network blocks
 		// DialTimeout but allows a real TLS dial.
 		ordered = ips
 	}
+	ordered = d.deprioritizeFailed(host, ordered)
 	if len(attempts) == 0 {
 		attempts = config.AutoRoute().Attempts
+	}
+	// Reuse the strategy that worked last time. candidate() already ranks the
+	// last-good IP first, but without this the ECH/SNI/direct attempts are
+	// replayed from scratch on every new connection, which wastes a shared ECH
+	// lookup and a handshake on routes where a later strategy is the winner.
+	if _, cachedMode, ok := d.CachedPlan(host); ok && cachedMode != "" {
+		attempts = preferAttempt(attempts, cachedMode)
 	}
 	var lastErr error
 	for _, ip := range ordered {
@@ -199,11 +412,22 @@ func (d *Dialer) DialTLS(ctx context.Context, host, port string, attempts []conf
 			var echConfig []byte
 			switch attempt.Mode {
 			case "ech":
-				if attempt.Ech == "own" {
-					echConfig = answer.ECH
+				var sharedECH func() []byte
+				if d.resolver != nil {
+					sharedECH = func() []byte {
+						shared, err := d.resolver.SharedECH(ctx)
+						if err != nil {
+							lastErr = err
+							return nil
+						}
+						return shared
+					}
 				}
+				echConfig = echConfigFor(attempt, answer.ECH, sharedECH)
 				if len(echConfig) == 0 {
-					lastErr = fmt.Errorf("no ECHConfig for %s", host)
+					if lastErr == nil {
+						lastErr = fmt.Errorf("no ECHConfig for %s", host)
+					}
 					continue
 				}
 			}
@@ -225,34 +449,7 @@ func (d *Dialer) DialTLS(ctx context.Context, host, port string, attempts []conf
 					}
 				}
 			}
-			tlsCfg := &tls.Config{
-				ServerName:                     serverName,
-				MinVersion:                     tls.VersionTLS12,
-				EncryptedClientHelloConfigList: echConfig,
-				NextProtos:                     []string{"h2", "http/1.1"},
-			}
-			// Verify the real domain even when the SNI is disguised.
-			verifyName := host
-			tlsCfg.InsecureSkipVerify = serverName != host || len(echConfig) > 0
-			if tlsCfg.InsecureSkipVerify {
-				tlsCfg.VerifyPeerCertificate = func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
-					if len(rawCerts) == 0 {
-						return fmt.Errorf("no certificate from %s", host)
-					}
-					cert, err := x509.ParseCertificate(rawCerts[0])
-					if err != nil {
-						return err
-					}
-					roots, err := x509.SystemCertPool()
-					if err != nil {
-						return err
-					}
-					if _, err := cert.Verify(x509.VerifyOptions{Roots: roots, DNSName: verifyName}); err != nil {
-						return err
-					}
-					return nil
-				}
-			}
+			tlsCfg := buildTLSConfig(host, serverName, echConfig)
 			tlsConn := tls.Client(conn, tlsCfg)
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				_ = conn.Close()
@@ -268,6 +465,29 @@ func (d *Dialer) DialTLS(ctx context.Context, host, port string, attempts []conf
 		lastErr = fmt.Errorf("no usable route for %s", host)
 	}
 	return nil, nil, "", lastErr
+}
+
+// preferAttempt moves the first attempt matching mode to the front while
+// preserving the order of all other attempts. Returning the original slice
+// when there is nothing to move keeps the route policy untouched.
+func preferAttempt(attempts []config.RouteAttempt, mode string) []config.RouteAttempt {
+	if mode == "" {
+		return attempts
+	}
+	for i, a := range attempts {
+		if a.Mode != mode {
+			continue
+		}
+		if i == 0 {
+			return attempts
+		}
+		out := make([]config.RouteAttempt, 0, len(attempts))
+		out = append(out, a)
+		out = append(out, attempts[:i]...)
+		out = append(out, attempts[i+1:]...)
+		return out
+	}
+	return attempts
 }
 
 func (d *Dialer) remember(host string, ip net.IP) {
